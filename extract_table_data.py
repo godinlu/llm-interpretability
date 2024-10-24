@@ -1,14 +1,18 @@
+import os
 import re
 import numpy as np
+import pandas as pd
 import sqlite3
 import pickle
 
 
 raw_data_file = "Data/unfun_2023-02-02.sql"
 outputed_readable_file = "unfun_2023-02-02.sql"
-SQL_comand_PKL_file_name = "SQL_commands.pkl"
+#SQL_comand_PKL_file_name = "SQL_commands.pkl"
 outputed_db_file_name = "Unfunned_data.db"
 failed_comand_file_name = "failed_comands.pkl"
+output_filtered_csv = True
+filtered_csv_file_name = "unfun_2023.csv"
 
 # Removing unreadable lines from the data
 input_file = open(raw_data_file, 'r') 
@@ -112,8 +116,8 @@ with open(outputed_readable_file, 'r') as file:
 print("\n")
 
 # Saving outputed dictionary      
-with open(SQL_comand_PKL_file_name, "wb") as f:
-    pickle.dump(commands, f)
+#with open(SQL_comand_PKL_file_name, "wb") as f:
+#    pickle.dump(commands, f)
 
 #with open('tables.pkl', 'rb') as f:
 #    commands = pickle.load(f) # deserialize using load()
@@ -128,30 +132,92 @@ nb_errors = 0
 for table in np.array(list(commands.keys()))[["create" in string for string in list(commands.keys())]]:
     try:
         cursor.executescript(("".join(commands[table])).replace("ENGINE=InnoDB DEFAULT CHARSET=utf8", "").replace("\n",""))
-        print("Script executed successfully.")
+        print("Table created successfully.")
     except sqlite3.Error as e:
-        print(f"An error occurred: {e}")
+        print(f"An error occurred when creating table: {e}")
 for lines in np.array(list(commands.keys()))[["line" in string for string in list(commands.keys())]]:
         inserts_comands = ("".join(commands[lines])).split(");")
         for insert, idx in zip(inserts_comands, range(len(inserts_comands))):
             try:
-                sql_command = (insert+");").replace("\\'","''").replace('\\"', '"')
-                cursor.executescript(sql_command)
+                cursor.executescript((insert+");").replace("\\'","''").replace('\\"', '"'))
                 #print("Script executed successfully.")
             except sqlite3.Error as e:
                 nb_errors+=1
-                errors[lines] = sql_command
+                errors[lines].append((insert+");").replace("\\'","''").replace('\\"', '"'))
                 #errors[lines].append([idx, re.search('"(.+?)"', str(e)).group(1)])
-                print(f"An error occurred: during {lines} input, in INSERT: {idx}, {e}")
+                #print(f"An error occurred: during {lines} input, in INSERT: {idx}, {e}")
                 #print((insert+";").replace("\\'","''").replace('\\"', '"'))
 print("\n##############################################################\n")
 print(f"Total number of unexecuted INSERT comands: {nb_errors}")
 print(f"- original unexecuted INSERT: {len(errors["lines_original"])}")
 print(f"- unfunned unexecuted INSERT: {len(errors["lines_unfunned"])}")
 print(f"- ratings unexecuted INSERT: {len(errors["lines_ratings"])}")
-print(f"Saving dictionary of failed commands to: {failed_comand_file_name}")
+#print(f"Saving dictionary of failed commands to: {failed_comand_file_name}\n\n")
+## Saving failed commands   
+#with open(failed_comand_file_name, "wb") as f:
+#    pickle.dump(errors, f)
+
+print("\n##############################################################\n")
+print("Atempting to load errors chunks individualy")
+
+insert_header: str = ""
+individual_errors = {"lines_original": [],
+                     "lines_unfunned": [],
+                     "lines_ratings": []}
+counter_successful = 0
+counter_failed = 0
+for tab_label in errors:
+    for full_comand in errors[tab_label]:
+        for line in full_comand.split("\n"):
+            if line == "":
+                continue
+            elif line[:6] == "INSERT":
+                insert_header = line
+            else:
+                try:   
+                    cursor.execute(insert_header + " " + line[:-1] + ";")
+                    counter_successful+=1
+                except:
+                    individual_errors[tab_label].append(insert_header + " " + line[:-1] + ";")
+                    counter_failed+=1
+    print(f"For table: {tab_label}, Successful: {counter_successful}, Failed: {counter_failed}")
+
+#print(f"Saving dictionary of failed commands to: {failed_comand_file_name}\n\n")
 # Saving failed commands   
-with open(failed_comand_file_name, "wb") as f:
-    pickle.dump(errors, f)
+#with open(failed_comand_file_name, "wb") as f:
+#    pickle.dump(individual_errors, f)
+
+if output_filtered_csv:
+    request = """ SELECT DISTINCT O.id, O.title, U.title, R.rating, U.date
+                  FROM headlines_original O, headlines_unfunned U, ratings R
+                  WHERE O.id = U.original_headline_id 
+                  and R.id = O.id
+                  and U.title is not null;
+                  """
+    outputed_csv = pd.read_sql(request, con= conn).rename(columns={"title":"original_tile", "title.1":"unfuned_title"})
+    #print(f"col names: {outputed_csv.columns}")
+    replacement_dict = {"â€˜" : "'",
+                        "â€™" : "'"}
+
+    print("\nCleaning up strage characters")
+
+    for i in range(len(outputed_csv["id"])):
+        for key in replacement_dict:
+            try:
+                outputed_csv.iloc[i,1] = outputed_csv.iloc[i,1].replace(key,replacement_dict[key])
+            except:
+                pass
+            try:
+                outputed_csv.iloc[i,2] = outputed_csv.iloc[i,2].replace(key,replacement_dict[key])
+            except:
+                pass
+        print(f"{round((i*100)/len(outputed_csv["id"]))}%",end="\r")
+
+    outputed_csv.to_csv(filtered_csv_file_name, index=False)
+
+    
+
 conn.commit()
 conn.close()
+os.remove(outputed_readable_file)
+os.remove(outputed_db_file_name)
