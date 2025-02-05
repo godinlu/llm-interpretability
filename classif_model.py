@@ -1,5 +1,5 @@
 from typing import Dict, List, Any, Union
-from torch import Tensor, tensor, no_grad, argmax, unsqueeze
+from torch import Tensor, tensor, no_grad, argmax, unsqueeze, sum, abs
 import torch.nn as nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
@@ -35,6 +35,8 @@ class GlobalConfig:
     """How many iterations the learing rate sheduler waits with the improvment below the threashold before reducing learing rate."""
     lr_scheduler_threshold: float = 0.01
     """The improvement threashold for the learing rate sheduler."""
+    L1_lambda: float = 0.8
+    """The amount of regularization to be applied"""
     #early_stopping_parm: Dict[str, Any] = field(default_factory= lambda:{"monitor":'val_loss', 
     #                                                                     "mode":'min', 
     #                                                                     "min_delta": 0.001, 
@@ -55,7 +57,7 @@ class GlobalConfig:
     # dataset name
     path_to_data: Path = Path("Data", "pairs_with_ratings.tsv")
     """Path to the dataset name"""
-    path_to_save_cfg: Path = Path("saving_cfg_test.pkl")
+    path_to_save_cfg: Path = Path("gpt2_cfg.pkl")
     # Logging root dir: where to save the logger outputs
     logging_root_dir: str = "./logging"
     # Where to save the checkpoints
@@ -202,6 +204,23 @@ class TextClassifier(LightningModule):
         #    #for layer in self.model.h[0].attn:
         #        self.model.h[0].attn.register_forward_hook(hook_fn)
 
+        # Calculate the number of weights in the model use for L1 regularization
+        self.nweights = 0
+        """Number of none bias weights"""
+        for name,weights in self.named_parameters():
+            if 'bias' not in name:
+                self.nweights = self.nweights + weights.numel()
+        #print(f'Total number of weights in the model = {self.nweights}')
+
+    def calc_L1(self) -> Tensor:
+        # Calculate L1 term
+        L1_term = tensor(0., requires_grad=True)
+        for name, weights in self.named_parameters():
+            if 'bias' not in name:
+                weights_sum = sum(abs(weights))
+                L1_term = L1_term + weights_sum
+        return L1_term / self.nweights
+
     def forward(self, input_ids, attention_mask, labels=None):
         outputs = self.model(input_ids, attention_mask=attention_mask) #!!!!!!!!!!! remove if extracted manualy !!!!!!!!!!!!!!!!!!
         pooled_output = outputs.last_hidden_state[:, -1, :]  # Use last token's hidden state
@@ -211,7 +230,9 @@ class TextClassifier(LightningModule):
     def training_step(self, batch: Dict[str, Any], batch_idx: int):
         logits, _, _= self(input_ids=batch['input_ids'], attention_mask=batch['attention_mask'])
         loss = self.criterion(logits, batch['label_ids'])
-        self.log("train_loss", loss, on_step=False, on_epoch=True, batch_size=self.cfg.batch_size_train)
+        if self.cfg.L1_lambda != None:
+            loss = loss - self.calc_L1() * self.cfg.L1_lambda
+        self.log("train_loss", loss, on_step=True, on_epoch=True, batch_size=self.cfg.batch_size_train)
         return loss
 
     def validation_step(self, batch, batch_ix):
