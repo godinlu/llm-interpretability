@@ -271,7 +271,7 @@ class TextClassifier(LightningModule):
                  #save_output_file_name: str = None
                  ) -> Dict[str, Any]:
         self.eval()
-        all_preds, all_labels, all_attentions, all_tokens, classifier_activations = [], [], [], [], []
+        all_preds, all_labels, all_attentions, all_tokens, all_classifier_activations = [], [], [], [], []
         with no_grad():
             print("Making predictions...")
             # For each batch extract all relevent information
@@ -286,12 +286,13 @@ class TextClassifier(LightningModule):
                 all_attentions.append(attentions)
                 #all_texts.extend(batch['input_texts'])
                 all_tokens.extend(batch['input_ids'])
+                all_classifier_activations.append(classifier_activations)
         out = {"accuracy" : accuracy_score(all_labels, all_preds), 
                 "predictions" : all_preds,
                 "tokens" : all_tokens,
                 "targets" : all_labels,
                 "attentions" : all_attentions,
-                "classif_activations" : classifier_activations}
+                "classif_activations" : unpack_activations(all_classifier_activations)}
         # Add model parameter values
         out.update({"parameters" : {"languag_model" : self.model.state_dict(),
                                     "classifier" : self.classifier.nn.state_dict()}})
@@ -303,32 +304,38 @@ class TextClassifier(LightningModule):
         return out
 
 def load_and_evaluate(path_to_model: str,
-                      path_to_cfg: str, 
+                      cfg: GlobalConfig, 
                       dataloader: DataLoader, 
                       save_output_path: str = None) -> Dict[str, Any]:
-    with open(path_to_cfg, "rb") as file:
-        cfg = load(file)
     model = TextClassifier.load_from_checkpoint(path_to_model, cfg=cfg)
     model.eval()
-    all_preds, all_labels, all_attentions, all_tokens = [], [], [], []
+    all_preds, all_labels, all_attentions, all_tokens, all_classifier_activations = [], [], [], [], []
     with no_grad():
         print("Making predictions...")
         # For each batch extract all relevent information
         for batch in tqdm(dataloader):
-            logits, attentions = model(input_ids=batch['input_ids'], attention_mask=batch['attention_mask'])
+            logits, attentions, classifier_activations = model(input_ids=batch['input_ids'], attention_mask=batch['attention_mask'])
+            #classifier_activations.extend(logits.clone().detach())
             preds = argmax(logits, dim=1).cpu().numpy()
             labels = batch['label_ids'].cpu().numpy()
             all_preds.extend(preds)
             all_labels.extend(labels)
-            all_attentions.extend(attentions)
-            all_tokens.extend(batch['input_texts'])
+            # The tuple (dimention 1) is the number of attention layers then [batch size, nb attention heads, len(text), len(text)]
+            all_attentions.append(attentions)
+            #all_texts.extend(batch['input_texts'])
+            all_tokens.extend(batch['input_ids'])
+            all_classifier_activations.append(classifier_activations)
     out = {"accuracy" : accuracy_score(all_labels, all_preds), 
             "predictions" : all_preds,
             "tokens" : all_tokens,
             "targets" : all_labels,
-            "attentions" : all_attentions}
+            "attentions" : all_attentions,
+            "classif_activations" : all_classifier_activations}
+    # Add model parameter values
+    out.update({"parameters" : {"languag_model" : model.model.state_dict(),
+                                "classifier" : model.classifier.nn.state_dict()}})
     # Save the output if path specified
-    if save_output_path != None:
+    if model.cfg.model_file_name != None:
         with open(save_output_path, "wb+") as file:
             dump(out, file)
         print(f"Saved output to: {save_output_path}")
@@ -358,4 +365,24 @@ def unpack_attentions(attentions: List[Tensor], bertviz_compatible: bool = False
                 out.append([att[obs_idx] for att in attentions[batch_idx]])
             else:
                 out.append([unsqueeze(att[obs_idx], dim=0) for att in attentions[batch_idx]])
+    return out
+
+def unpack_activations(activations: List[Dict[str, Tensor]]) -> List[Dict[str, Tensor]]:
+    """Unpacks batched attentions placing each one into it's own tensor.
+    ## Args:
+        - activations (list): The list of batched activations from model prediction.
+    ## Returns:
+        - list: List of dictionaries with each dictionary containing
+    """    
+    out: List[Dict[str, Tensor]] = []
+    keys = list(activations[0].keys())
+    batch_size = activations[0][keys[0]].shape[0]
+    last_batch_size = activations[-1][keys[0]].shape[0]
+    final_nb = batch_size * (len(activations) - 1) + last_batch_size
+    for _ in range(final_nb):
+        out.append({})
+    for layer_key in keys:
+        for batch_idx in range(len(activations)):
+            for in_batch_idx in range(activations[batch_idx][keys[0]].shape[0]):
+                out[in_batch_idx + (batch_size * batch_idx)].update({layer_key : activations[batch_idx][layer_key][in_batch_idx]})
     return out
