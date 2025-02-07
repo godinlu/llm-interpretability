@@ -15,6 +15,7 @@ from pathlib import Path
 from pandas import read_csv, concat
 from tqdm import tqdm
 from pickle import dump, load
+import mgzip
 #from pprint import pprint
 
 @dataclass
@@ -37,6 +38,17 @@ class GlobalConfig:
     """The improvement threashold for the learing rate sheduler."""
     L1_lambda: float = 0.8
     """The amount of regularization to be applied"""
+    fixed_pading: bool = True
+    """Indicates if the same padding length should be applied to all inputs to the model.
+    The max padding is then set to the longest input in the dataloader and all inputs will be padded to that length.
+    If true will ignore the max_input_length value."""
+    max_input_length: int = 512
+    clasif_layer_to_extract: List[str] = field(default_factory=lambda: ["Dropout2", "Dropout5"])
+    """List containing the names of all the classifier layer to be extracted"""
+    extract_lm_parameters: bool = False
+    """Indicates if the model output should output the language model parameters. (They take up a lot of space)"""
+    extract_clasif_parameters: bool = False
+    """Indicates if the model output should output the classification layer parameters. (They take up a lot of space)"""
     #early_stopping_parm: Dict[str, Any] = field(default_factory= lambda:{"monitor":'val_loss', 
     #                                                                     "mode":'min', 
     #                                                                     "min_delta": 0.001, 
@@ -49,11 +61,12 @@ class GlobalConfig:
     # Name of the HF pretrained MLM to use as an encoder
     model_name: str = "distilbert/distilgpt2"#'distilgpt2'
     model_file_name: str = "gpt2_L1"
-    max_input_length: int = 512
+    compress_results_file: bool = False
+    """If true will compress the resulting file using mgzip. False is default as it takes time to compress."""
     use_lower_case: bool = True
     """Indicates if all text loaded into the data loaders should be set to lower case. (It should be. As most unfuned titles are all in capitals)"""
     #label_col_names: List[str] = field(default_factory=lambda: ["Prix"])
-    """List of column names that contain labels (this should determin the nb of clasifier layers)"""
+    #"""List of column names that contain labels (this should determin the nb of clasifier layers)"""
     #input_text_col_name: str = "Avis"
     # dataset name
     path_to_data: Path = Path("Data", "pairs_with_ratings.tsv")
@@ -101,6 +114,22 @@ class DataProcessor:
         data_train = [{"title" : title.lower() if cfg.use_lower_case else title, "target" : target} for title, target in zip(x_train, y_train)]
         data_validation = [{"title" : title.lower() if cfg.use_lower_case else title, "target" : target} for title, target in zip(x_validation, y_validation)]
         data_test = [{"title" : title.lower() if cfg.use_lower_case else title, "target" : target} for title, target in zip(x_test, y_test)]
+        # If using same padding length for all inputs find the longest token sequence
+        if self.cfg.fixed_pading:
+            max_len = 0
+            for text in data_train:
+                tokens_len = len(self.tokenizer.tokenize(text["title"]))
+                if tokens_len > max_len:
+                    max_len = tokens_len
+            for text in data_validation:
+                tokens_len = len(self.tokenizer.tokenize(text["title"]))
+                if tokens_len > max_len:
+                    max_len = tokens_len
+            for text in data_test:
+                tokens_len = len(self.tokenizer.tokenize(text["title"]))
+                if tokens_len > max_len:
+                    max_len = tokens_len
+            self.cfg.max_input_length = max_len
         # Creating data loaders
         data_loader_train = DataLoader(data_train, 
                                       shuffle=True, 
@@ -128,15 +157,27 @@ class DataProcessor:
         if samples_is_dict:
             # If list of dicts is imputed
             input_texts = [sample["title"] for sample in samples]
-            encoded_input = self.tokenizer(input_texts, add_special_tokens=True, padding='longest', truncation=True,
-                                       max_length=self.cfg.max_input_length, return_attention_mask=True,
-                                       return_tensors='pt', return_offsets_mapping=False, return_token_type_ids=False,
-                                       verbose=False, )
+            encoded_input = self.tokenizer(input_texts, 
+                                           add_special_tokens=True, 
+                                           padding='max_length' if self.cfg.fixed_pading else 'longest', 
+                                           truncation=True,
+                                           max_length=self.cfg.max_input_length, 
+                                           return_attention_mask=True,
+                                           return_tensors='pt', 
+                                           return_offsets_mapping=False, 
+                                           return_token_type_ids=False,
+                                           verbose=False, )
         else:
             # If simple list of texts is inputed
-            encoded_input = self.tokenizer(samples, add_special_tokens=True, padding='longest', truncation=True,
-                                           max_length=self.cfg.max_input_length, return_attention_mask=True,
-                                           return_tensors='pt', return_offsets_mapping=False, return_token_type_ids=False,
+            encoded_input = self.tokenizer(samples, 
+                                           add_special_tokens=True, 
+                                           padding='max_length' if self.cfg.fixed_pading else 'longest', 
+                                           truncation=True,
+                                           max_length=self.cfg.max_input_length, 
+                                           return_attention_mask=True,
+                                           return_tensors='pt', 
+                                           return_offsets_mapping=False, 
+                                           return_token_type_ids=False,
                                            verbose=False, )
         # build batch
         batch = {
@@ -154,7 +195,7 @@ class DataProcessor:
 # First, a classifier component (a simple PyTorch NN module)
 class ClassifierComponent(nn.Module):
 
-    def __init__(self, input_dim: int, dropout: float):
+    def __init__(self, input_dim: int, dropout: float, layer_list: List[str] = None):
         super().__init__()
         k = 2
         self.nn = nn.Sequential(nn.Linear(input_dim, input_dim * k),
@@ -164,13 +205,26 @@ class ClassifierComponent(nn.Module):
                                 nn.ReLU(),
                                 nn.Dropout(dropout),
                                 nn.Linear(input_dim, 2))
+        # Find the indexes of the layers that we want to extract
+        #self.returned_layer_activation_indexes: List[int] = []
+        #"""List of indexes of the layers we wish to extract"""
+        #self.include_input: bool = "input" in layer_list
+        #"""If activation output should include inputs"""
+        #for idx, layer in enumerate(self.nn):
+        #    layer_name = layer._get_name() + str(idx)
+        #    if layer_list != None:
+        #        if layer_name in layer_list:
+        #            self.returned_layer_activation_indexes.append(idx)
+        #    # If the list is set to None then return all layers
+        #    else:
+        #        self.returned_layer_activation_indexes.append(idx)
 
     def forward(self, X):
         """
         :param X:   B x d
         :return:
         """
-        activations = {"input" : X}
+        activations = {}
         for idx, layer in enumerate(self.nn):
             X = layer(X)
             activations[layer._get_name() + str(idx)] = X
@@ -270,13 +324,13 @@ class TextClassifier(LightningModule):
                  dataloader: DataLoader,
                  #save_output_file_name: str = None
                  ) -> Dict[str, Any]:
-        self.eval()
+        self.eval().cuda(device=0)
         all_preds, all_labels, all_attentions, all_tokens, all_classifier_activations = [], [], [], [], []
         with no_grad():
             print("Making predictions...")
             # For each batch extract all relevent information
             for batch in tqdm(dataloader):
-                logits, attentions, classifier_activations = self(input_ids=batch['input_ids'], attention_mask=batch['attention_mask'])
+                logits, attentions, classifier_activations = self(input_ids=batch['input_ids'].cuda(0), attention_mask=batch['attention_mask'].cuda(0))
                 #classifier_activations.extend(logits.clone().detach())
                 preds = argmax(logits, dim=1).cpu().numpy()
                 labels = batch['label_ids'].cpu().numpy()
@@ -284,23 +338,34 @@ class TextClassifier(LightningModule):
                 all_labels.extend(labels)
                 # The tuple (dimention 1) is the number of attention layers then [batch size, nb attention heads, len(text), len(text)]
                 all_attentions.append(attentions)
-                #all_texts.extend(batch['input_texts'])
                 all_tokens.extend(batch['input_ids'])
                 all_classifier_activations.append(classifier_activations)
+        # Filter out layers that are not tracked
+        all_classifier_activations = unpack_activations(all_classifier_activations)
+        for idx in range(len(all_classifier_activations)):
+            new_dict = {}
+            for key in self.cfg.clasif_layer_to_extract:
+                new_dict.update({key : all_classifier_activations[idx][key]})
+            all_classifier_activations[idx] = new_dict
         out = {"accuracy" : accuracy_score(all_labels, all_preds), 
                 "predictions" : all_preds,
                 "tokens" : all_tokens,
                 "targets" : all_labels,
                 "attentions" : all_attentions,
-                "classif_activations" : unpack_activations(all_classifier_activations)}
+                "classif_activations" : all_classifier_activations}
         # Add model parameter values
-        out.update({"parameters" : {"languag_model" : self.model.state_dict(),
-                                    "classifier" : self.classifier.nn.state_dict()}})
+        out.update({"parameters" : {"languag_model" : self.model.state_dict() if self.cfg.extract_lm_parameters else None,
+                                    "classifier" : self.classifier.nn.state_dict() if self.cfg.extract_clasif_parameters else None}})
         # Save the output if path specified
         if self.cfg.model_file_name != None:
-            with open(Path(self.cfg.logging_root_dir) / Path(self.cfg.model_file_name) / f"{self.cfg.model_file_name}_res.pkl", "wb+") as file:
-                dump(out, file)
-            print(f"Saved output to: {self.cfg.model_file_name}_res.pkl")
+            if self.cfg.compress_results_file:
+                with mgzip.open((Path(self.cfg.logging_root_dir) / Path(self.cfg.model_file_name) / f"{self.cfg.model_file_name}_res.bt").as_posix(), "wb") as file:
+                    dump(out, file)
+                print(f"Saved output to: {self.cfg.model_file_name}_res.bt")
+            else:
+                with open(Path(self.cfg.logging_root_dir) / Path(self.cfg.model_file_name) / f"{self.cfg.model_file_name}_res.pkl", "wb") as file:
+                    dump(out, file)
+                print(f"Saved output to: {self.cfg.model_file_name}_res.pkl")
         return out
 
 def load_and_evaluate(path_to_model: str,
@@ -386,3 +451,13 @@ def unpack_activations(activations: List[Dict[str, Tensor]]) -> List[Dict[str, T
             for in_batch_idx in range(activations[batch_idx][keys[0]].shape[0]):
                 out[in_batch_idx + (batch_size * batch_idx)].update({layer_key : activations[batch_idx][layer_key][in_batch_idx]})
     return out
+
+def average_attentions(concat, indi):
+    return
+
+def average_activations(concat, indi):
+    return
+
+def average_output(concatinated: Dict[str, Any], individual_output: Dict[str, Any]) -> Dict[str, Any]:
+    
+    return
