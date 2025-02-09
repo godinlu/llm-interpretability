@@ -6,12 +6,13 @@ if __name__ == '__main__':
     cfg: GlobalConfig = GlobalConfig(model_name = 'distilbert/distilgpt2',
                                      max_epochs=1,
                                      batch_size_train=124,
-                                     path_to_save_cfg = Path("test_cfg.pkl"),
-                                     model_file_name = "test",
+                                     path_to_save_cfg = Path("gpt2_L1_pad_cfg_3.pkl"),
+                                     model_file_name = "gpt2_L1_pad_3",
                                      L1_lambda = 0.8,
                                      fixed_pading = True,
                                      extract_lm_parameters = True,
-                                     extract_clasif_parameters = True)
+                                     extract_clasif_parameters = True,
+                                     compress_results_file=False)
     # Create data processor object that handles all data formating operations
     data_processor = DataProcessor(cfg)
     #load_and_evaluate("C:/Users/andre/Documents/Cours/SSD/M2/ProjetM2/lightning_logs/version_2/checkpoints/epoch=0-step=497.ckpt",

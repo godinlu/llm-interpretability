@@ -1,5 +1,6 @@
-from typing import Dict, List, Any, Union
-from torch import Tensor, tensor, no_grad, argmax, unsqueeze, sum, abs
+from typing import Dict, List, Any, Union, Callable, Iterable
+from torch import Tensor, tensor, no_grad, argmax, unsqueeze, sum, abs, zeros, max
+from torch.cuda import empty_cache
 import torch.nn as nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
@@ -15,7 +16,7 @@ from pathlib import Path
 from pandas import read_csv, concat
 from tqdm import tqdm
 from pickle import dump, load
-import mgzip
+from concurrent.futures import ThreadPoolExecutor
 #from pprint import pprint
 
 @dataclass
@@ -23,8 +24,7 @@ class GlobalConfig:
     # list of devices on which model is run
     #device: int = 0
     #accelerator: str = "gpu"
-    # dropout
-    #dropout: int = 0.1
+    dropout: int = 0.2
     # batch size
     batch_size_train: int = 16
     #batch_size_predict: int = 16
@@ -45,10 +45,15 @@ class GlobalConfig:
     max_input_length: int = 512
     clasif_layer_to_extract: List[str] = field(default_factory=lambda: ["Dropout2", "Dropout5"])
     """List containing the names of all the classifier layer to be extracted"""
+    save_model: bool = True
+    """Indicates if the model should be saved to a file."""
     extract_lm_parameters: bool = False
     """Indicates if the model output should output the language model parameters. (They take up a lot of space)"""
     extract_clasif_parameters: bool = False
     """Indicates if the model output should output the classification layer parameters. (They take up a lot of space)"""
+    formating_output_function: Callable = None
+    """The function through which the final output will be passed. Can be used to condense attentions head and activation values 
+    in order to save file space."""
     #early_stopping_parm: Dict[str, Any] = field(default_factory= lambda:{"monitor":'val_loss', 
     #                                                                     "mode":'min', 
     #                                                                     "min_delta": 0.001, 
@@ -58,22 +63,20 @@ class GlobalConfig:
     max_epochs: int = 10
     # number of workers for the data loaders
     num_workers: int = 8
-    # Name of the HF pretrained MLM to use as an encoder
     model_name: str = "distilbert/distilgpt2"#'distilgpt2'
+    """Hugging face reference for the language model to be used."""
     model_file_name: str = "gpt2_L1"
+    """Name of the file in which all model traing and evaluation results will be stored."""
     compress_results_file: bool = False
     """If true will compress the resulting file using mgzip. False is default as it takes time to compress."""
     use_lower_case: bool = True
     """Indicates if all text loaded into the data loaders should be set to lower case. (It should be. As most unfuned titles are all in capitals)"""
-    #label_col_names: List[str] = field(default_factory=lambda: ["Prix"])
-    #"""List of column names that contain labels (this should determin the nb of clasifier layers)"""
-    #input_text_col_name: str = "Avis"
-    # dataset name
     path_to_data: Path = Path("Data", "pairs_with_ratings.tsv")
     """Path to the dataset name"""
     path_to_save_cfg: Path = Path("gpt2_cfg.pkl")
-    # Logging root dir: where to save the logger outputs
+    """Name of the file that saves the configuration object related to the model."""
     logging_root_dir: str = "./logging"
+    """Logging root dir: where to save the logger outputs"""
     # Where to save the checkpoints
     #ckpt_root_dir: str = "./ckpt"
     # torch precision
@@ -238,7 +241,7 @@ class TextClassifier(LightningModule):
         self.model = AutoModel.from_pretrained(cfg.model_name, output_attentions=True)
         #self.model = AutoModelForSequenceClassification.from_pretrained(cfg.model_name, output_attentions=True)
         #self.classifier = nn.Linear(self.model.config.hidden_size, num_labels)
-        self.classifier = ClassifierComponent(self.model.config.hidden_size, 0.2)
+        self.classifier = ClassifierComponent(self.model.config.hidden_size, cfg.dropout)
         self.lr = cfg.lr
         self.criterion = nn.CrossEntropyLoss()
 
@@ -332,14 +335,18 @@ class TextClassifier(LightningModule):
             for batch in tqdm(dataloader):
                 logits, attentions, classifier_activations = self(input_ids=batch['input_ids'].cuda(0), attention_mask=batch['attention_mask'].cuda(0))
                 #classifier_activations.extend(logits.clone().detach())
-                preds = argmax(logits, dim=1).cpu().numpy()
+                preds = argmax(logits.cpu(), dim=1).cpu().numpy()
                 labels = batch['label_ids'].cpu().numpy()
+                #temp = batch['attention_mask'].cpu()
+                #del batch["attention_mask"], temp
                 all_preds.extend(preds)
                 all_labels.extend(labels)
                 # The tuple (dimention 1) is the number of attention layers then [batch size, nb attention heads, len(text), len(text)]
-                all_attentions.append(attentions)
-                all_tokens.extend(batch['input_ids'])
+                all_attentions.append([att.cpu() for att in attentions])
+                all_tokens.extend(batch['input_ids'].cpu())
                 all_classifier_activations.append(classifier_activations)
+                del logits, attentions, classifier_activations
+            del batch
         # Filter out layers that are not tracked
         all_classifier_activations = unpack_activations(all_classifier_activations)
         for idx in range(len(all_classifier_activations)):
@@ -356,17 +363,31 @@ class TextClassifier(LightningModule):
         # Add model parameter values
         out.update({"parameters" : {"languag_model" : self.model.state_dict() if self.cfg.extract_lm_parameters else None,
                                     "classifier" : self.classifier.nn.state_dict() if self.cfg.extract_clasif_parameters else None}})
+        out["parameters"] = unbind_parm_from_vram(out["parameters"])
+        # Apply finale transformation on outputed data such as averaging all the activation head values.
+        if self.cfg.formating_output_function != None:
+            out = self.cfg.formating_output_function(out)
         # Save the output if path specified
-        if self.cfg.model_file_name != None:
-            if self.cfg.compress_results_file:
-                with mgzip.open((Path(self.cfg.logging_root_dir) / Path(self.cfg.model_file_name) / f"{self.cfg.model_file_name}_res.bt").as_posix(), "wb") as file:
-                    dump(out, file)
-                print(f"Saved output to: {self.cfg.model_file_name}_res.bt")
-            else:
+        if self.cfg.save_model:
+            #if self.cfg.compress_results_file:
+            #    with mgzip.open((Path(self.cfg.logging_root_dir) / Path(self.cfg.model_file_name) / f"{self.cfg.model_file_name}_res.bt").as_posix(), "wb") as file:
+            #        dump(out, file)
+            #        file.close()
+            #    print(f"Saved output to: {self.cfg.model_file_name}_res.bt")
+            #else:
                 with open(Path(self.cfg.logging_root_dir) / Path(self.cfg.model_file_name) / f"{self.cfg.model_file_name}_res.pkl", "wb") as file:
                     dump(out, file)
+                    file.close()
                 print(f"Saved output to: {self.cfg.model_file_name}_res.pkl")
+        empty_cache()
         return out
+
+def unbind_parm_from_vram(param_dict: Dict[str, Dict[str, Tensor]]) -> Dict[str, Dict[str, Tensor]]:
+    """Used to remove parameter values from vram memory."""
+    for model_key in param_dict:
+        for key in param_dict[model_key]:
+            param_dict[model_key][key] = param_dict[model_key][key].cpu()
+    return param_dict
 
 def load_and_evaluate(path_to_model: str,
                       cfg: GlobalConfig, 
@@ -379,32 +400,54 @@ def load_and_evaluate(path_to_model: str,
         print("Making predictions...")
         # For each batch extract all relevent information
         for batch in tqdm(dataloader):
-            logits, attentions, classifier_activations = model(input_ids=batch['input_ids'], attention_mask=batch['attention_mask'])
+            logits, attentions, classifier_activations = model(input_ids=batch['input_ids'].cuda(0), attention_mask=batch['attention_mask'].cuda(0))
             #classifier_activations.extend(logits.clone().detach())
-            preds = argmax(logits, dim=1).cpu().numpy()
+            preds = argmax(logits.cpu(), dim=1).cpu().numpy()
             labels = batch['label_ids'].cpu().numpy()
+            #temp = batch['attention_mask'].cpu()
+            #del batch["attention_mask"], temp
             all_preds.extend(preds)
             all_labels.extend(labels)
             # The tuple (dimention 1) is the number of attention layers then [batch size, nb attention heads, len(text), len(text)]
-            all_attentions.append(attentions)
-            #all_texts.extend(batch['input_texts'])
-            all_tokens.extend(batch['input_ids'])
+            all_attentions.append([att.cpu() for att in attentions])
+            all_tokens.extend(batch['input_ids'].cpu())
             all_classifier_activations.append(classifier_activations)
-    out = {"accuracy" : accuracy_score(all_labels, all_preds), 
-            "predictions" : all_preds,
-            "tokens" : all_tokens,
-            "targets" : all_labels,
-            "attentions" : all_attentions,
-            "classif_activations" : all_classifier_activations}
-    # Add model parameter values
-    out.update({"parameters" : {"languag_model" : model.model.state_dict(),
-                                "classifier" : model.classifier.nn.state_dict()}})
-    # Save the output if path specified
-    if model.cfg.model_file_name != None:
-        with open(save_output_path, "wb+") as file:
-            dump(out, file)
-        print(f"Saved output to: {save_output_path}")
-    return out
+            del logits, attentions, classifier_activations
+        del batch
+        # Filter out layers that are not tracked
+        all_classifier_activations = unpack_activations(all_classifier_activations)
+        for idx in range(len(all_classifier_activations)):
+            new_dict = {}
+            for key in cfg.clasif_layer_to_extract:
+                new_dict.update({key : all_classifier_activations[idx][key]})
+            all_classifier_activations[idx] = new_dict
+        out = {"accuracy" : accuracy_score(all_labels, all_preds), 
+                "predictions" : all_preds,
+                "tokens" : all_tokens,
+                "targets" : all_labels,
+                "attentions" : all_attentions,
+                "classif_activations" : all_classifier_activations}
+        # Add model parameter values
+        out.update({"parameters" : {"languag_model" : model.model.state_dict() if model.cfg.extract_lm_parameters else None,
+                                    "classifier" : model.classifier.nn.state_dict() if model.cfg.extract_clasif_parameters else None}})
+        out["parameters"] = unbind_parm_from_vram(out["parameters"])
+        # Apply finale transformation on outputed data such as averaging all the activation head values.
+        if cfg.formating_output_function != None:
+            out = cfg.formating_output_function(out)
+        # Save the output if path specified
+        if cfg.save_model:
+            #if self.cfg.compress_results_file:
+            #    with mgzip.open((Path(self.cfg.logging_root_dir) / Path(self.cfg.model_file_name) / f"{self.cfg.model_file_name}_res.bt").as_posix(), "wb") as file:
+            #        dump(out, file)
+            #        file.close()
+            #    print(f"Saved output to: {self.cfg.model_file_name}_res.bt")
+            #else:
+                with open(save_output_path, "wb") as file:
+                    dump(out, file)
+                    file.close()
+                print(f"Saved output to: {cfg.model_file_name}_res.pkl")
+        empty_cache()
+        return out
 
 def unpack_attentions(attentions: List[Tensor], bertviz_compatible: bool = False) -> List[List[Tensor]]:
     """Unpacks batched attentions placing each one into it's own tensor.
@@ -427,9 +470,9 @@ def unpack_attentions(attentions: List[Tensor], bertviz_compatible: bool = False
     for batch_idx in range(len(attentions)):
         for obs_idx in range(len(attentions[batch_idx][0])):
             if not bertviz_compatible:
-                out.append([att[obs_idx] for att in attentions[batch_idx]])
+                out.append([att[obs_idx].cpu() for att in attentions[batch_idx]])
             else:
-                out.append([unsqueeze(att[obs_idx], dim=0) for att in attentions[batch_idx]])
+                out.append([unsqueeze(att[obs_idx], dim=0).cpu() for att in attentions[batch_idx]])
     return out
 
 def unpack_activations(activations: List[Dict[str, Tensor]]) -> List[Dict[str, Tensor]]:
@@ -449,15 +492,110 @@ def unpack_activations(activations: List[Dict[str, Tensor]]) -> List[Dict[str, T
     for layer_key in keys:
         for batch_idx in range(len(activations)):
             for in_batch_idx in range(activations[batch_idx][keys[0]].shape[0]):
-                out[in_batch_idx + (batch_size * batch_idx)].update({layer_key : activations[batch_idx][layer_key][in_batch_idx]})
+                out[in_batch_idx + (batch_size * batch_idx)].update({layer_key : activations[batch_idx][layer_key][in_batch_idx].cpu()})
     return out
 
-def average_attentions(concat, indi):
-    return
+def sum_head(tensor1: Tensor, tensor2: Tensor) -> Tensor:
+    return tensor1 + tensor2
 
-def average_activations(concat, indi):
-    return
+def max_head(tensor1: Tensor, tensor2: Tensor) -> Tensor:
+    return max(tensor1, tensor2)
 
-def average_output(concatinated: Dict[str, Any], individual_output: Dict[str, Any]) -> Dict[str, Any]:
-    
-    return
+def apply_to_layers(layer1: List[Tensor], layer2: List[Tensor], fun: Callable) -> List[Tensor]:
+    with ThreadPoolExecutor() as executor:
+        res = list(executor.map(fun, layer1, layer2))
+    return res
+
+def apply_to_attentions(attentions: List[List[Tensor]], fun: Callable) -> List[Tensor]:
+    """Given a list of attention head outputs applies the given function to all attention values in the list cumulatively.
+    Such as summing or finding the max the values of all the attention heads."""
+    out = []
+    for idx in range(len(attentions[0])):
+        out.append(zeros(attentions[0][0].shape))
+    for idx in range(len(attentions)):
+        out = apply_to_layers(out, attentions[idx], fun)
+    return out
+
+def apply_to_attentions_cond(attentions: List[List[Tensor]], 
+                             fun: Callable, 
+                             pred_vect: Iterable,
+                             target_vect: Iterable) -> List[Tensor]:
+    """Given a list of attention head outputs applies the given function to all attention values in the list cumulatively.
+    Such as summing or finding the max the values of all the attention heads."""
+    att_is_fun = []
+    att_is_unfun = []
+    att_pred_fun = []
+    att_pred_unfun = []
+    # debug
+    #debug = [0,0,0,0]
+    for idx in range(len(attentions[0])):
+        att_is_fun.append(zeros(attentions[0][0].shape))
+        att_is_unfun.append(zeros(attentions[0][0].shape))
+        att_pred_fun.append(zeros(attentions[0][0].shape))
+        att_pred_unfun.append(zeros(attentions[0][0].shape))
+    for idx in range(len(attentions)):
+        if target_vect[idx] == 0:
+            att_is_fun = apply_to_layers(att_is_fun, attentions[idx], fun)
+            #debug[0] += 1
+        else:
+            att_is_unfun = apply_to_layers(att_is_unfun, attentions[idx], fun)
+            #debug[1] += 1
+        if pred_vect[idx] == 0:
+            att_pred_fun = apply_to_layers(att_is_unfun, attentions[idx], fun)
+            #debug[2] += 1
+        else:
+            att_pred_unfun = apply_to_layers(att_is_unfun, attentions[idx], fun)
+            #debug[3] += 1
+    #print(f"debug val: {debug}")
+    return att_is_fun, att_is_unfun, att_pred_fun, att_pred_unfun
+
+def div_attentions(attentions: List[Tensor], val: int) -> List[Tensor]:
+    """Divides each values in the attention head by the given value"""
+    with ThreadPoolExecutor() as executor:
+        res = list(executor.map(lambda head: head / val, attentions))
+    return res
+
+def apply_to_2_activations(act1: Dict[str, Tensor], act2: Dict[str, Tensor], fun: Callable) -> Dict[str, Tensor]:
+    out = {}
+    with ThreadPoolExecutor() as executor:
+        res = list(executor.map(fun, act1.values(), act2.values()))
+    for idx, key in enumerate(act1):
+        out.update({key : res[idx]})
+    return out
+
+def apply_to_all_activation(activations: List[Dict[str, Tensor]], fun: Callable) -> Dict[str, Tensor]:
+    """Apply function to all activations in list. Such as sum all activation values."""
+    out = {}
+    for key in activations[0]:
+        out.update({key : zeros(activations[0][key].shape)})
+    for act in activations:
+        out = apply_to_2_activations(out, act, fun)
+    return out
+
+def format_output(res: Dict[str, Any]) -> Dict[str, Any]:
+    res["attentions"] = unpack_attentions(res["attentions"])
+    #nb_obs = len(res["attentions"])
+    # Get mean values
+    val_list = list(apply_to_attentions_cond(res["attentions"].copy(), 
+                                             sum_head, 
+                                             res["predictions"], 
+                                             res["targets"]))
+    for idx in range(len(val_list)):
+        val_list[idx] = div_attentions(val_list[idx], len(val_list[idx]))
+    # Get max values
+    val_list.extend(list(apply_to_attentions_cond(res["attentions"].copy(), 
+                                                  max_head, 
+                                                  res["predictions"], 
+                                                  res["targets"])))
+    res.pop("attentions")
+    names = ["att_is_fun_mean", 
+             "att_is_unfun_mean", 
+             "att_pred_fun_mean", 
+             "att_pred_unfun_mean",
+             "att_is_fun_max", 
+             "att_is_unfun_max", 
+             "att_pred_fun_max", 
+             "att_pred_unfun_max"]
+    for idx, val in enumerate(val_list):
+        res.update({names[idx] : val})
+    return res
