@@ -73,8 +73,6 @@ class GlobalConfig:
     """Indicates if all text loaded into the data loaders should be set to lower case. (It should be. As most unfuned titles are all in capitals)"""
     path_to_data: Path = Path("Data", "pairs_with_ratings.tsv")
     """Path to the dataset name"""
-    path_to_save_cfg: Path = Path("gpt2_cfg.pkl")
-    """Name of the file that saves the configuration object related to the model."""
     logging_root_dir: str = "./logging"
     """Logging root dir: where to save the logger outputs"""
     # Where to save the checkpoints
@@ -244,24 +242,9 @@ class TextClassifier(LightningModule):
         self.classifier = ClassifierComponent(self.model.config.hidden_size, cfg.dropout)
         self.lr = cfg.lr
         self.criterion = nn.CrossEntropyLoss()
-
         # Set pad token if missing
-        self.model.config.pad_token_id = self.model.config.eos_token_id
-
-        # Store attention outputs
-        #self.attention_outputs = []
-        # Register hook for capturing attention weights
-        #def hook_fn(module, input, output):
-        #    self.attention_outputs.extend(output)
-        ## Check to see if model has a transformer attribute
-        ##print(f"Has attribute: {hasattr(self.model, "transformer")}")
-        #if hasattr(self.model, "transformer"):
-        #    for layer in self.model.transformer.h: #.transformer.h !!!!!!!!!!!!!!!! Update this to make it adapte to model structure !!!!!!!!!!!!!!!!!!!!!!!
-        #        layer.attn.register_forward_hook(hook_fn)
-        #else:
-        #    #for layer in self.model.h[0].attn:
-        #        self.model.h[0].attn.register_forward_hook(hook_fn)
-
+        if self.model.config.pad_token_id == None:
+            self.model.config.pad_token_id = self.model.config.eos_token_id # Use end of sequence token as padding token
         # Calculate the number of weights in the model use for L1 regularization
         self.nweights = 0
         """Number of none bias weights"""
@@ -280,10 +263,11 @@ class TextClassifier(LightningModule):
         return L1_term / self.nweights
 
     def forward(self, input_ids, attention_mask, labels=None):
-        outputs = self.model(input_ids, attention_mask=attention_mask) #!!!!!!!!!!! remove if extracted manualy !!!!!!!!!!!!!!!!!!
-        pooled_output = outputs.last_hidden_state[:, -1, :]  # Use last token's hidden state
+        outputs = self.model(input_ids, output_hidden_states=True)
+        pooled_output = outputs.last_hidden_state.mean(dim=1)  # Use last token's hidden state
+        #print(outputs.last_hidden_state.shape)
         logits, activations = self.classifier(pooled_output)
-        return logits, outputs[-1], activations #, self.attention_outputs
+        return logits, outputs["hidden_states"], activations #, self.attention_outputs
 
     def training_step(self, batch: Dict[str, Any], batch_idx: int):
         logits, _, _= self(input_ids=batch['input_ids'], attention_mask=batch['attention_mask'])
@@ -318,7 +302,7 @@ class TextClassifier(LightningModule):
         trainer = Trainer(max_epochs=self.cfg.max_epochs,
                           logger=logger)
         trainer.fit(self, training_data_loader, validation_data_loader)
-        with open(Path(self.cfg.logging_root_dir) / Path(self.cfg.model_file_name) / self.cfg.path_to_save_cfg, "wb+") as file:
+        with open(Path(self.cfg.logging_root_dir) / Path(self.cfg.model_file_name) / Path(f"{self.cfg.model_file_name}_cfg"), "wb+") as file:
                 dump(self.cfg, file)
                 #print(f"Saved cfg object to: {self.cfg.path_to_save_cfg}")
 
@@ -333,7 +317,8 @@ class TextClassifier(LightningModule):
             print("Making predictions...")
             # For each batch extract all relevent information
             for batch in tqdm(dataloader):
-                logits, attentions, classifier_activations = self(input_ids=batch['input_ids'].cuda(0), attention_mask=batch['attention_mask'].cuda(0))
+                logits, attentions, classifier_activations = self(input_ids=batch['input_ids'].cuda(0), 
+                                                                  attention_mask=batch['attention_mask'].cuda(0))
                 #classifier_activations.extend(logits.clone().detach())
                 preds = argmax(logits.cpu(), dim=1).cpu().numpy()
                 labels = batch['label_ids'].cpu().numpy()
